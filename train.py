@@ -85,6 +85,7 @@ def get_IEMOCAP_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=Fals
 
 def train_or_eval_model(args, model, dataloader, optimizer=None, train=False):
     losses, preds, labels, masks = [], [], [], []
+    softmax_list = []
 
     assert not train or optimizer != None
     loss_func = nn.CrossEntropyLoss()
@@ -111,36 +112,37 @@ def train_or_eval_model(args, model, dataloader, optimizer=None, train=False):
 
         modal_logits, modal_features = model(modal_input, umask, qmask, lengths)
 
-
         umask_bool = umask.bool()
         labels_ = label[umask_bool]
         modal_features = modal_features[umask_bool]
         modal_logits = modal_logits[umask_bool]
 
         loss = loss_func(modal_logits, labels_)
-
+        logits_softmax = F.softmax(modal_logits, dim=1)
+        softmax_list.extend(logits_softmax.data.cpu().numpy().tolist())
 
         pred_ = torch.argmax(modal_logits, 1)
-        preds.append(pred_.data.cpu().numpy())
-        labels.append(labels_.data.cpu().numpy())
-        masks.append(umask.view(-1).cpu().numpy())
-
-        losses.append(loss.item() * masks[-1].sum())
+        preds.extend(pred_.data.cpu().numpy().tolist())
+        labels.extend(labels_.data.cpu().numpy().tolist())
+        masks.extend(umask.view(-1).cpu().numpy().tolist())
+        losses.append(loss.item())
 
         if train:
             loss.backward()
             optimizer.step()
 
-    if preds != []:
-        preds = np.concatenate(preds)
-        labels = np.concatenate(labels)
-        masks = np.concatenate(masks)
-    else:
-        return float('nan'), float('nan'), [], [], [], float('nan')
-
-    avg_loss = round(np.sum(losses) / np.sum(masks), 4)
+    avg_loss = round(np.sum(losses), 4)
     avg_accuracy = round(accuracy_score(labels, preds) * 100, 2)
     avg_fscore = round(f1_score(labels, preds, average='weighted') * 100, 2)
+
+    results = {
+        'preds': preds,
+        'labels': labels,
+        'softmax': softmax_list,
+    }
+    with open(f'results/softmax_list_{args.modal}.json', 'w') as f:
+        json.dump(results, f)
+    print(f'results/softmax_list_{args.modal}.json has been saved!')
 
     return avg_loss, avg_accuracy, labels, preds, masks, avg_fscore
 
@@ -160,7 +162,7 @@ if __name__ == '__main__':
     parser.add_argument('--class-weight', action='store_true', default=True, help='use class weights')
     parser.add_argument('--Dataset', default='IEMOCAP', help='dataset to train and test')
     parser.add_argument('--seed', type=int, default=2025, help='random seed')
-    parser.add_argument('--train', type=bool, default=True, help="Is or Isn't train")
+    parser.add_argument('--train', type=bool, default=False, help="Is or Isn't train")
     parser.add_argument('--modal', type=str, default='video', choices=['text', 'video', 'audio'], help='modal to train')
     args = parser.parse_args()
 
@@ -261,9 +263,6 @@ if __name__ == '__main__':
         print(classification_report(test_label, test_pred, digits=4))
         print(confusion_matrix(test_label, test_pred))
 
-
-    print(classification_report(best_label, best_pred, digits=4))
-    print(confusion_matrix(best_label, best_pred))
 
 
 
