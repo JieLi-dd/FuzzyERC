@@ -173,19 +173,52 @@ class Unimodal_GatedFusion(nn.Module):
         return final_rep
 
 
-class Multimodal_GatedFusion(nn.Module):
+class Multimodal_NoiseFusion(nn.Module):
     def __init__(self, hidden_size):
-        super(Multimodal_GatedFusion, self).__init__()
+        super(Multimodal_NoiseFusion, self).__init__()
         self.fc = nn.Linear(hidden_size, hidden_size, bias=False)
         self.softmax = nn.Softmax(dim=-2)
+        self.max_noise_scale = 1
 
-    def forward(self, a, b, c):
+    def forward(self, text_logit, audio_logit, video_logit, text_feature, audio_feature, video_feature):
         """
-        :param a: (batch_size, len, dim)
-        :param b: (batch_size, len, dim)
-        :param c: (batch_size, len, dim)
+        :param text: (batch_size, len, dim)
+        :param audio: (batch_size, len, dim)
+        :param video: (batch_size, len, dim)
         :return: (batch_size, len, dim)
         """
+
+        def compute_entropy(logits):
+            probs = F.softmax(logits, dim=-1)
+            entropy = - (probs * torch.log(probs + 1e-8)).sum(dim=-1)
+            return entropy
+
+        # Step 1: compute each modal entropy
+        entropy_text = compute_entropy(text_logit)
+        entropy_audio = compute_entropy(audio_logit)
+        entropy_video = compute_entropy(video_logit)
+
+        # Step 2: find the most entropy modal
+        all_entropy = torch.stack([entropy_text, entropy_audio, entropy_video], dim=2)
+        target_entropy, _ = all_entropy.max(dim=2, keepdim=True)
+
+        # Step 3: compute the distance between target entropy and each modal
+        def add_noise_feature(feature, entropy, target_entropy):
+            entropy_diff = (target_entropy.squeeze(2) - entropy).clamp(min=0)
+            scale = torch.tanh(entropy_diff) * self.max_noise_scale  # (B,L,)
+            scale = scale.view(feature.size(0), -1, 1)
+            noise = torch.randn_like(feature) * scale
+            return feature + noise
+
+        # Step 4: add noise to each modal
+        # text_feature_noise = add_noise_feature(text_feature, entropy_text, target_entropy)
+        # audio_feature_noise = add_noise_feature(audio_feature, entropy_audio, target_entropy)
+        # video_feature_noise = add_noise_feature(video_feature, entropy_video, target_entropy)
+        a = add_noise_feature(text_feature, entropy_text, target_entropy)
+        b = add_noise_feature(audio_feature, entropy_audio, target_entropy)
+        c = add_noise_feature(video_feature, entropy_video, target_entropy)
+
+
         a_new = a.unsqueeze(-2)
         b_new = b.unsqueeze(-2)
         c_new = c.unsqueeze(-2)
@@ -199,6 +232,50 @@ class Multimodal_GatedFusion(nn.Module):
 
         return final_rep
 
+
+class CSCQueue(nn.Module):
+    """
+    Momentum queue storing features, true labels and predicted labels for CSC loss.
+    """
+    def __init__(self, queue_size, feature_dim, device):
+        super(CSCQueue, self).__init__()
+        self.queue_size = queue_size
+        self.features = torch.zeros(queue_size, feature_dim, device=device)
+        self.true_labels = torch.full((queue_size,), -1, dtype=torch.long, device=device)
+        self.pred_labels = torch.full((queue_size,), -1, dtype=torch.long, device=device)
+        self.ptr = 0
+
+    @torch.no_grad()
+    def enqueue(self, feat: torch.Tensor, true: torch.Tensor, pred: torch.Tensor):
+        """Enqueue a batch of features and labels (circular buffer)."""
+        b = feat.size(0)
+        end = self.ptr + b
+        if end <= self.queue_size:
+            self.features[self.ptr:end] = feat
+            self.true_labels[self.ptr:end] = true
+            self.pred_labels[self.ptr:end] = pred
+        else:
+            overflow = end - self.queue_size
+            self.features[self.ptr:] = feat[:b - overflow]
+            self.true_labels[self.ptr:] = true[:b - overflow]
+            self.pred_labels[self.ptr:] = pred[:b - overflow]
+            self.features[:overflow] = feat[b - overflow:]
+            self.true_labels[:overflow] = true[b - overflow:]
+            self.pred_labels[:overflow] = pred[b - overflow:]
+        self.ptr = end % self.queue_size
+
+    def get_positive_negative(self, label: torch.Tensor):
+        """
+        For anchors of class `label`,
+        positive: queue entries with pred == true == label
+        negative: queue entries with pred == label but true != label
+        """
+        mask_pred_label = (self.pred_labels == label)
+        mask_true_eq_pred = mask_pred_label & (self.true_labels == self.pred_labels)
+        mask_false_pred = mask_pred_label & (self.true_labels != self.pred_labels)
+        pos = self.features[mask_true_eq_pred]
+        neg = self.features[mask_false_pred]
+        return pos, neg
 
 
 class Unimodal_Based_Model(nn.Module):
@@ -242,94 +319,25 @@ class Unimodal_Based_Model(nn.Module):
         return x_logits, x_input
 
 
-class Transformer_Based_Model(nn.Module):
+class Multimodal_Based_Model(nn.Module):
     def __init__(self, dataset, temp, D_text, D_visual, D_audio, n_head,
                  n_classes, hidden_dim, n_speakers, dropout):
-        super(Transformer_Based_Model, self).__init__()
-        self.temp = temp
-        self.n_classes = n_classes
-        self.n_speakers = n_speakers
-        if self.n_speakers == 2:
-            padding_idx = 2
-        if self.n_speakers == 9:
-            padding_idx = 9
-        self.speaker_embeddings = nn.Embedding(n_speakers + 1, hidden_dim, padding_idx)
+        super(Multimodal_Based_Model, self).__init__()
+        self.text = Unimodal_Based_Model(dataset, temp, D_text, n_head, n_classes, hidden_dim, n_speakers, dropout)
+        self.audio = Unimodal_Based_Model(dataset, temp, D_audio, n_head, n_classes, hidden_dim, n_speakers, dropout)
+        self.video = Unimodal_Based_Model(dataset, temp, D_visual, n_head, n_classes, hidden_dim, n_speakers, dropout)
 
-        # Temporal convolutional layers
-        self.textf_input = nn.Conv1d(D_text, hidden_dim, kernel_size=1, padding=0, bias=False)
-        self.acouf_input = nn.Conv1d(D_audio, hidden_dim, kernel_size=1, padding=0, bias=False)
-        self.visuf_input = nn.Conv1d(D_visual, hidden_dim, kernel_size=1, padding=0, bias=False)
-
-        # Self-Transformers
-        self.t_t = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
-        self.a_a = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
-        self.v_v = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
-
-
-        # Unimodal-level Gated Fusion
-        self.t_t_gate = Unimodal_GatedFusion(hidden_dim, dataset)
-        self.a_a_gate = Unimodal_GatedFusion(hidden_dim, dataset)
-        self.v_v_gate = Unimodal_GatedFusion(hidden_dim, dataset)
-
-        # Multimodal-level Gated Fusion
-        self.last_gate = Multimodal_GatedFusion(hidden_dim)
-
-        # Emotion Classifier
-        self.t_output_layer = nn.Sequential(
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, n_classes)
-        )
-        self.a_output_layer = nn.Sequential(
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, n_classes)
-        )
-        self.v_output_layer = nn.Sequential(
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, n_classes)
-        )
-        self.all_output_layer = nn.Linear(hidden_dim, n_classes)
+        self.noise_fusion = Multimodal_NoiseFusion(hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, n_classes)
 
 
 
     def forward(self, textf, visuf, acouf, u_mask, qmask, dia_len):
-        spk_idx = torch.argmax(qmask, -1)
-        origin_spk_idx = spk_idx
-        if self.n_speakers == 2:
-            for i, x in enumerate(dia_len):
-                spk_idx[i, x:] = (2 * torch.ones(origin_spk_idx[i].size(0) - x)).int().cuda()
-        if self.n_speakers == 9:
-            for i, x in enumerate(dia_len):
-                spk_idx[i, x:] = (9 * torch.ones(origin_spk_idx[i].size(0) - x)).int().cuda()
-        spk_embeddings = self.speaker_embeddings(spk_idx)
+        text_logit, text_features = self.text(textf, u_mask, qmask, dia_len)
+        audio_logit, audio_features = self.audio(acouf, u_mask, qmask, dia_len)
+        video_logit, video_features = self.video(visuf, u_mask, qmask, dia_len)
 
-        # Temporal convolutional layers
-        textf = self.textf_input(textf.permute(1, 2, 0)).transpose(1, 2)
-        acouf = self.acouf_input(acouf.permute(1, 2, 0)).transpose(1, 2)
-        visuf = self.visuf_input(visuf.permute(1, 2, 0)).transpose(1, 2)
+        final_featrures = self.noise_fusion(text_logit, audio_logit, video_logit, text_features, audio_features, video_features)
+        final_logits = self.classifier(final_featrures)
 
-        # Self-Transformers
-        t_t_transformer_out = self.t_t(textf, textf, u_mask, spk_embeddings)
-        a_a_transformer_out = self.a_a(acouf, acouf, u_mask, spk_embeddings)
-        v_v_transformer_out = self.v_v(visuf, visuf, u_mask, spk_embeddings)
-
-        # Unimodal-level Gated Fusion
-        t_t_transformer_out = self.t_t_gate(t_t_transformer_out)
-        a_a_transformer_out = self.a_a_gate(a_a_transformer_out)
-        v_v_transformer_out = self.v_v_gate(v_v_transformer_out)
-
-        # Multimodal-level Gated Fusion
-        all_transformer_out = self.last_gate(t_t_transformer_out, a_a_transformer_out, v_v_transformer_out)
-
-        # Emotion Classifier
-        t_final_out = self.t_output_layer(t_t_transformer_out)
-        a_final_out = self.a_output_layer(a_a_transformer_out)
-        v_final_out = self.v_output_layer(v_v_transformer_out)
-        all_final_out = self.all_output_layer(all_transformer_out)
-
-
-
-
-        return all_final_out, t_final_out, a_final_out, v_final_out, t_t_transformer_out, a_a_transformer_out, v_v_transformer_out
+        return final_logits, text_logit, audio_logit, video_logit, final_featrures, text_features, audio_features, video_features
