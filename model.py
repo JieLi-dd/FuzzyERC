@@ -173,52 +173,19 @@ class Unimodal_GatedFusion(nn.Module):
         return final_rep
 
 
-class Multimodal_NoiseFusion(nn.Module):
+class Multimodal_GatedFusion(nn.Module):
     def __init__(self, hidden_size):
-        super(Multimodal_NoiseFusion, self).__init__()
+        super(Multimodal_GatedFusion, self).__init__()
         self.fc = nn.Linear(hidden_size, hidden_size, bias=False)
         self.softmax = nn.Softmax(dim=-2)
-        self.max_noise_scale = 1
 
-    def forward(self, text_logit, audio_logit, video_logit, text_feature, audio_feature, video_feature):
+    def forward(self, a, b, c):
         """
-        :param text: (batch_size, len, dim)
-        :param audio: (batch_size, len, dim)
-        :param video: (batch_size, len, dim)
+        :param a: (batch_size, len, dim)
+        :param b: (batch_size, len, dim)
+        :param c: (batch_size, len, dim)
         :return: (batch_size, len, dim)
         """
-
-        def compute_entropy(logits):
-            probs = F.softmax(logits, dim=-1)
-            entropy = - (probs * torch.log(probs + 1e-8)).sum(dim=-1)
-            return entropy
-
-        # Step 1: compute each modal entropy
-        entropy_text = compute_entropy(text_logit)
-        entropy_audio = compute_entropy(audio_logit)
-        entropy_video = compute_entropy(video_logit)
-
-        # Step 2: find the most entropy modal
-        all_entropy = torch.stack([entropy_text, entropy_audio, entropy_video], dim=2)
-        target_entropy, _ = all_entropy.max(dim=2, keepdim=True)
-
-        # Step 3: compute the distance between target entropy and each modal
-        def add_noise_feature(feature, entropy, target_entropy):
-            entropy_diff = (target_entropy.squeeze(2) - entropy).clamp(min=0)
-            scale = torch.tanh(entropy_diff) * self.max_noise_scale  # (B,L,)
-            scale = scale.view(feature.size(0), -1, 1)
-            noise = torch.randn_like(feature) * scale
-            return feature + noise
-
-        # Step 4: add noise to each modal
-        # text_feature_noise = add_noise_feature(text_feature, entropy_text, target_entropy)
-        # audio_feature_noise = add_noise_feature(audio_feature, entropy_audio, target_entropy)
-        # video_feature_noise = add_noise_feature(video_feature, entropy_video, target_entropy)
-        a = add_noise_feature(text_feature, entropy_text, target_entropy)
-        b = add_noise_feature(audio_feature, entropy_audio, target_entropy)
-        c = add_noise_feature(video_feature, entropy_video, target_entropy)
-
-
         a_new = a.unsqueeze(-2)
         b_new = b.unsqueeze(-2)
         c_new = c.unsqueeze(-2)
@@ -231,51 +198,6 @@ class Multimodal_NoiseFusion(nn.Module):
         final_rep = torch.gather(utters, dim=-2, index=max_indices).squeeze(-2)  # (batch_size, len, dim)
 
         return final_rep
-
-
-class CSCQueue(nn.Module):
-    """
-    Momentum queue storing features, true labels and predicted labels for CSC loss.
-    """
-    def __init__(self, queue_size, feature_dim, device):
-        super(CSCQueue, self).__init__()
-        self.queue_size = queue_size
-        self.features = torch.zeros(queue_size, feature_dim, device=device)
-        self.true_labels = torch.full((queue_size,), -1, dtype=torch.long, device=device)
-        self.pred_labels = torch.full((queue_size,), -1, dtype=torch.long, device=device)
-        self.ptr = 0
-
-    @torch.no_grad()
-    def enqueue(self, feat: torch.Tensor, true: torch.Tensor, pred: torch.Tensor):
-        """Enqueue a batch of features and labels (circular buffer)."""
-        b = feat.size(0)
-        end = self.ptr + b
-        if end <= self.queue_size:
-            self.features[self.ptr:end] = feat
-            self.true_labels[self.ptr:end] = true
-            self.pred_labels[self.ptr:end] = pred
-        else:
-            overflow = end - self.queue_size
-            self.features[self.ptr:] = feat[:b - overflow]
-            self.true_labels[self.ptr:] = true[:b - overflow]
-            self.pred_labels[self.ptr:] = pred[:b - overflow]
-            self.features[:overflow] = feat[b - overflow:]
-            self.true_labels[:overflow] = true[b - overflow:]
-            self.pred_labels[:overflow] = pred[b - overflow:]
-        self.ptr = end % self.queue_size
-
-    def get_positive_negative(self, label: torch.Tensor):
-        """
-        For anchors of class `label`,
-        positive: queue entries with pred == true == label
-        negative: queue entries with pred == label but true != label
-        """
-        mask_pred_label = (self.pred_labels == label)
-        mask_true_eq_pred = mask_pred_label & (self.true_labels == self.pred_labels)
-        mask_false_pred = mask_pred_label & (self.true_labels != self.pred_labels)
-        pos = self.features[mask_true_eq_pred]
-        neg = self.features[mask_false_pred]
-        return pos, neg
 
 
 class Unimodal_Based_Model(nn.Module):
@@ -297,8 +219,6 @@ class Unimodal_Based_Model(nn.Module):
         self.modal_intra = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
         self.modal_intra_fusion = Unimodal_GatedFusion(hidden_size=hidden_dim, dataset=dataset)
 
-        self.modal_classfier = nn.Linear(hidden_dim, n_classes)
-
     def forward(self, x_input,  u_mask, qmask, dia_len):
         spk_idx = torch.argmax(qmask, -1)
         origin_spk_idx = spk_idx
@@ -314,9 +234,8 @@ class Unimodal_Based_Model(nn.Module):
         x_input = self.modal_input(x_input.permute(1, 2, 0)).transpose(1, 2)
         x_input = self.modal_intra(x_input, x_input, u_mask, spk_embeddings)
         x_input = self.modal_intra_fusion(x_input)
-        x_logits = self.modal_classfier(x_input)
 
-        return x_logits, x_input
+        return x_input
 
 
 class Multimodal_Based_Model(nn.Module):
@@ -327,7 +246,7 @@ class Multimodal_Based_Model(nn.Module):
         self.audio = Unimodal_Based_Model(dataset, temp, D_audio, n_head, n_classes, hidden_dim, n_speakers, dropout)
         self.video = Unimodal_Based_Model(dataset, temp, D_visual, n_head, n_classes, hidden_dim, n_speakers, dropout)
 
-        self.noise_fusion = Multimodal_NoiseFusion(hidden_dim)
+        self.fusion = Multimodal_GatedFusion(hidden_dim)
         self.classifier = nn.Linear(hidden_dim, n_classes)
 
 
@@ -337,7 +256,102 @@ class Multimodal_Based_Model(nn.Module):
         audio_logit, audio_features = self.audio(acouf, u_mask, qmask, dia_len)
         video_logit, video_features = self.video(visuf, u_mask, qmask, dia_len)
 
-        final_featrures = self.noise_fusion(text_logit, audio_logit, video_logit, text_features, audio_features, video_features)
+        final_featrures = self.fusion( text_features, audio_features, video_features)
         final_logits = self.classifier(final_featrures)
 
         return final_logits, text_logit, audio_logit, video_logit, final_featrures, text_features, audio_features, video_features
+
+
+class ConfidenceEstimator(nn.Module):
+    def __init__(self, feat_dim, num_classes):
+        super(ConfidenceEstimator, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feat_dim + num_classes, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+            nn.Sigmoid()  # 输出 ∈ [0, 1]
+        )
+    def forward(self, h, logit):
+        h = torch.cat([h, logit], dim=-1)
+        return self.net(h)
+
+
+class ConfidenceFusionModel(nn.Module):
+    def  __init__(self, dataset, temp, D_text, D_visual, D_audio, n_head, n_classes, hidden_dim, n_speakers, dropout):
+        super(ConfidenceFusionModel, self).__init__()
+        self.num_modalities = 3
+        self.encoders = nn.ModuleList([
+            Unimodal_Based_Model(dataset, temp, D, n_head, n_classes, hidden_dim, n_speakers, dropout)
+            for D in [D_text, D_audio, D_visual]
+        ])
+        self.classifiers = nn.ModuleList([
+            nn.Linear(hidden_dim, n_classes) for _ in [D_text, D_audio, D_visual]
+        ])
+        self.conf_estimators = nn.ModuleList([
+            ConfidenceEstimator(hidden_dim, n_classes) for _ in [D_text, D_audio, D_visual]
+        ])
+        self.fusion = nn.Linear(hidden_dim, n_classes)
+
+
+    def forward(self, textf, visuf, acouf, u_mask, qmask, dia_len, labels):
+        input = [textf, acouf, visuf]
+        hs, logits, weights, conf_losses = [], [], [], []
+        hfs = []
+
+        umask_bool = u_mask.bool()
+        labels_ = labels[umask_bool]
+
+        for x, enc, clf, conf_net in zip(input, self.encoders, self.classifiers, self.conf_estimators):
+            h = enc(x, u_mask, qmask, dia_len)
+            logit = clf(h)
+
+            h = h[umask_bool]
+            logit = logit[umask_bool]
+
+            hs.append(h)
+            logits.append(logit)
+
+            #  计算置信度
+            conf_score = conf_net(h, logit).squeeze(-1)
+            weights.append(conf_score)
+
+            if labels_ is not None:
+                pred = logit.argmax(dim=-1)
+                correct = (pred == labels_).float()
+                conf_losses.append(F.binary_cross_entropy(conf_score, correct))
+
+        # 权重归一化
+        weights_tensor = torch.stack(weights, dim=1)  # [B, M]
+        norm_weights = weights_tensor / (weights_tensor.sum(dim=1, keepdim=True) + 1e-6)
+
+        # 加权融合
+        hs_tensor = torch.stack(hs, dim=1)  # [B, M, D]
+        fused = (norm_weights.unsqueeze(-1) * hs_tensor).sum(dim=1)  # [B, D]
+        hfs.append(fused)
+
+        # 最终融合预测
+        out = self.fusion(fused)  # [B, C]
+
+        ranking_loss = torch.tensor(0.0, device=out.device)
+        if labels_ is not None:
+            B, M = weights_tensor.shape
+            corrects = torch.stack([
+                (logit.argmax(dim=1) == labels_).float() for logit in logits
+            ], dim=1)
+
+            s_i = weights_tensor.unsqueeze(2)
+            s_j = weights_tensor.unsqueeze(1)
+            margin = s_i - s_j
+
+            correct_i = corrects.unsqueeze(2)
+            wrong_j = 1.0 - corrects.unsqueeze(1)
+            valid_pair_mask = correct_i * wrong_j
+            pos_margin = margin[valid_pair_mask.bool()]
+            if pos_margin.numel() > 0:
+                ranking_loss = F.relu(1.0 - pos_margin).mean()
+
+        return hs, hfs, out, logits, weights_tensor, conf_losses, ranking_loss
